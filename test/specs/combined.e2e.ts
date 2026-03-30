@@ -1,4 +1,5 @@
 import workspacePage from 'test/pageobjects/workspace.page';
+import { obsidianPage } from 'wdio-obsidian-service';
 
 describe('Test basic deduplicate', function() {
     beforeEach(async function() {
@@ -34,5 +35,22 @@ describe('Test basic deduplicate', function() {
         await workspacePage.matchWorkspace([[
             {type: "markdown", file: "Loop.md", active: true},
         ]]);
+    })
+
+    it('dedup across splits with multiple tabs', async function() {
+        if ((await obsidianPage.getPlatform()).isMobile) this.skip();
+
+        // Test that switching to duplicate tab doesn't change active tab
+        // See https://github.com/jesse-r-s-hines/obsidian-open-tab-settings/issues/56
+
+        await workspacePage.loadPlatformWorkspaceLayout("split-multi-tab");
+        // [[D.md (active), A.md], [Loop.md]]
+
+        await workspacePage.openLink(await workspacePage.getLink("Loop"));
+
+        await workspacePage.matchWorkspace([
+            [{file: "D.md", currentTab: true}, {file: "A.md", currentTab: false}],
+            [{file: "Loop.md", active: true, currentTab: true}],
+        ]);
     })
 })

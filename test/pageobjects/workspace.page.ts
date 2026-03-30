@@ -10,7 +10,10 @@ type LeafInfo = {
     parent: string, root: string, container: string,
     type: string, file: string,
     deferred: boolean, pinned: boolean,
+    /** True if this leaf is the globally focused leaf */
     active: boolean,
+    /** True if this leaf is selected within its tab group */
+    currentTab: boolean,
 }
 
 class WorkspacePage {
@@ -81,6 +84,7 @@ class WorkspacePage {
                         file: (leaf.getViewState()?.state?.file ?? "") as string,
                         deferred: leaf.isDeferred, pinned: leaf.pinned,
                         active: activeLeaf == leaf,
+                        currentTab: leaf.parent.children.indexOf(leaf) === leaf.parent.currentTab,
                     };
                 })
             );
