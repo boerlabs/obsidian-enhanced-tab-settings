@@ -268,7 +268,15 @@ export default class OpenTabSettingsPlugin extends Plugin {
                     // If the leaf is still empty, close it. This can happen if the file was de-duplicated while
                     // "openInNewTab" is enabled, or if you open a file "in default app" in a new tab.
                     if (isEmptyLeaf(this) && this.parent.children.length > 1) {
+                        const tabGroup = this.parent;
+                        const wasCurrentTab = tabGroup.children[tabGroup.currentTab] === this;
+                        const lastActiveTab = tabGroup.children
+                            .filter(l => l !== this)
+                            .reduce((max, l) => l.activeTime > max.activeTime ? l : max);
                         this.detach();
+                        if (wasCurrentTab) {
+                            tabGroup.selectTabIndex(tabGroup.children.findIndex(c => c === lastActiveTab));
+                        }
                     }
 
                     delete this.openTabSettings;
