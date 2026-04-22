@@ -1,10 +1,10 @@
 {
-	"id": "open-tab-settings",
-	"name": "Open Tab Settings",
-	"version": "2.0.1",
+	"id": "enhanced-tab-settings",
+	"name": "Enhanced Tab Settings",
+	"version": "1.0.0",
 	"minAppVersion": "1.8.3",
-	"description": "Adds options to customize how tabs are opened, including open in new tab by default, preventing duplicate tabs, and more.",
-	"author": "jesse-r-s-hines",
-	"authorUrl": "https://github.com/jesse-r-s-hines",
+	"description": "Customize tab opening behavior with preview tabs, deduplication, and placement control.",
+	"author": "Boer Zhang",
+	"authorUrl": "https://github.com/boerlabs",
 	"isDesktopOnly": false
 }

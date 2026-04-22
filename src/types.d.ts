@@ -7,6 +7,7 @@ declare module "obsidian" {
             openMode: PaneType|false,
             override: Partial<OpenTabSettingsPluginSettings>,
             openedFrom?: string,
+            isPreview?: boolean,
         },
         pinned: boolean,
     }

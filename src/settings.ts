@@ -29,6 +29,8 @@ export interface OpenTabSettingsPluginSettings {
     newTabPlacement: keyof typeof NEW_TAB_PLACEMENTS,
     newTabTabGroupPlacement: "same"|"opposite"|"first"|"last",
     modClickBehavior: keyof typeof MOD_CLICK_BEHAVIOR,
+    previewTabs: boolean,
+    previewTabsAutoPromote: boolean,
 }
 
 export const DEFAULT_SETTINGS: OpenTabSettingsPluginSettings = {
@@ -38,6 +40,8 @@ export const DEFAULT_SETTINGS: OpenTabSettingsPluginSettings = {
     newTabPlacement: "after-active",
     newTabTabGroupPlacement: "same",
     modClickBehavior: "tab",
+    previewTabs: false,
+    previewTabsAutoPromote: true,
 }
 
 export class OpenTabSettingsPluginSettingTab extends PluginSettingTab {
@@ -160,5 +164,31 @@ export class OpenTabSettingsPluginSettingTab extends PluginSettingTab {
                         });
                     })
             })
+
+        new Setting(this.containerEl)
+            .setName('Preview tabs')
+            .setDesc('Single click in file explorer previews files in a temporary tab. Double click or editing promotes to a permanent tab.')
+            .addToggle(toggle =>
+                toggle
+                    .setValue(this.plugin.settings.previewTabs)
+                    .onChange(async (value) => {
+                        await this.plugin.updateSettings({previewTabs: value});
+                        this.display();
+                    })
+            );
+
+        new Setting(this.containerEl)
+            .setName('Auto-promote on edit')
+            .setDesc('Promote a preview tab to permanent when you start editing it.')
+            .addToggle(toggle =>
+                toggle
+                    .setValue(this.plugin.settings.previewTabsAutoPromote)
+                    .onChange(async (value) => {
+                        await this.plugin.updateSettings({previewTabsAutoPromote: value});
+                    })
+            )
+            .setDisabled(!this.plugin.settings.previewTabs)
+            .settingEl
+            .setCssStyles({opacity: this.plugin.settings.previewTabs ? "" : "50%"});
     }
 }

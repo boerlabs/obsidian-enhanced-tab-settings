@@ -63,6 +63,11 @@ const OVERRIDES = {
 
 export default class OpenTabSettingsPlugin extends Plugin {
     settings: OpenTabSettingsPluginSettings = {...DEFAULT_SETTINGS};
+    private currentPreviewLeafId: string | null = null;
+    private nextOpenIsPreview: boolean = false;
+    private previewHandlersRegistered: boolean = false;
+    private boundClickHandler: ((evt: MouseEvent) => void) | null = null;
+    private boundDblClickHandler: ((evt: MouseEvent) => void) | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -70,6 +75,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
         this.addSettingTab(new OpenTabSettingsPluginSettingTab(this.app, this));
 
         this.registerMonkeyPatches();
+        this.registerPreviewTabHandlers();
 
         this.registerEvent(
             this.app.workspace.on("file-menu", (menu, file, source, leaf) => {
@@ -163,8 +169,33 @@ export default class OpenTabSettingsPlugin extends Plugin {
                     const settings = {...plugin.settings, ...override};
                     const activeLeaf = this.getActiveViewOfType(View)?.leaf;
 
+                    // Preview tab: intercept default (non-split, non-window) opens from file explorer
+                    const shouldPreview = (
+                        plugin.settings.previewTabs &&
+                        plugin.nextOpenIsPreview &&
+                        !openMode
+                    );
+                    plugin.nextOpenIsPreview = false; // consume the flag
+
                     let leaf: WorkspaceLeaf;
-                    if (openMode == 'tab' || (!openMode && settings.openInNewTab)) {
+                    if (shouldPreview) {
+                        // Find existing preview leaf globally
+                        let existingPreview: WorkspaceLeaf | undefined;
+                        if (plugin.currentPreviewLeafId) {
+                            const found = this.getLeafById(plugin.currentPreviewLeafId);
+                            if (found && isMainLeaf(found) && !isEmptyLeaf(found)) {
+                                existingPreview = found;
+                            }
+                        }
+                        if (existingPreview) {
+                            leaf = existingPreview;
+                            // Activate the reused preview leaf so the user sees the new file.
+                            // New leaves are activated inside createNewLeaf, but reused ones are not.
+                            this.setActiveLeaf(existingPreview);
+                        } else {
+                            leaf = plugin.createNewLeaf(true, settings);
+                        }
+                    } else if (openMode == 'tab' || (!openMode && settings.openInNewTab)) {
                         // Tabs opened via normal click are always focused regardless of focusNewTab setting.
                         leaf = plugin.createNewLeaf(!openMode ? true : undefined, settings);
                     } else if (!openMode) {
@@ -177,6 +208,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
                     leaf.openTabSettings = {
                         openMode, override,
                         openedFrom: activeLeaf?.id,
+                        isPreview: shouldPreview,
                     }
 
                     return leaf;
@@ -210,15 +242,22 @@ export default class OpenTabSettingsPlugin extends Plugin {
                     let match: WorkspaceLeaf|undefined;
 
                     // these values are only valid immediately after creating a leaf. We clear them after openFile,
-                    // and also clear them here if the leaf somehow gets populated without openFile
+                    // and also clear them here if the leaf somehow gets populated without openFile.
+                    // Read values BEFORE deleting — preview tab reuse sets openTabSettings on a non-empty leaf.
+                    const tabSettings = this.openTabSettings;
                     if (!isEmptyLeaf(this)) delete this.openTabSettings;
 
-                    const {openMode, override, openedFrom} = this.openTabSettings ?? {};
+                    const {openMode, override, openedFrom, isPreview} = tabSettings ?? {};
                     const settings = {...plugin.settings, ...override};
 
                     let matches = plugin.findMatchingLeaves(file);
                     if (!settings.deduplicateAcrossTabGroups) {
                         matches = matches.filter(l => l.parent == this.parent);
+                    }
+                    // When opening in preview mode, exclude existing preview tabs from dedup matches.
+                    // We want to find permanent tabs only — preview tabs should be reused, not deduped to.
+                    if (isPreview) {
+                        matches = matches.filter(l => !plugin.isPreviewTab(l.id));
                     }
 
                     // if leaf is new and was opened via an explicit open in new window, split, or "allow duplicate",
@@ -248,6 +287,10 @@ export default class OpenTabSettingsPlugin extends Plugin {
                     }
 
                     if (match) {
+                        // If dedup routes to a preview tab (from a non-file-explorer source), promote it
+                        if (plugin.isPreviewTab(match.id)) {
+                            plugin.promotePreviewTab(match.id);
+                        }
                         if (match.view.getViewType() == "kanban") {
                             // workaround for a bug in kanban. See
                             //     https://github.com/jesse-r-s-hines/obsidian-open-tab-settings/issues/25
@@ -256,13 +299,24 @@ export default class OpenTabSettingsPlugin extends Plugin {
                             result = undefined;
                         } else {
                             const activeLeaf = plugin.app.workspace.getActiveViewOfType(View)?.leaf;
+                            const shouldBeActive = !!openState?.active || activeLeaf == this;
                             result = await oldMethod.call(matches[0], file, {
                                 ...openState,
-                                active: !!openState?.active || activeLeaf == this,
+                                active: shouldBeActive,
                             }, ...args);
+                            // Explicitly activate — openFile may be a no-op when the file is already
+                            // showing, skipping the active flag processing.
+                            if (shouldBeActive) {
+                                plugin.app.workspace.setActiveLeaf(matches[0]);
+                            }
                         }
                     } else { // use default behavior
                         result = await oldMethod.call(this, file, openState, ...args);
+                    }
+
+                    // Preview tab bookkeeping
+                    if (isPreview && !match) {
+                        plugin.markAsPreview(this);
                     }
 
                     // If the leaf is still empty, close it. This can happen if the file was de-duplicated while
@@ -302,6 +356,13 @@ export default class OpenTabSettingsPlugin extends Plugin {
         }));
     }
 
+    onunload() {
+        this.removePreviewTabHandlers();
+        document.querySelectorAll('.is-preview-tab').forEach(el => {
+            el.classList.remove('is-preview-tab');
+        });
+    }
+
     async loadSettings() {
         const dataFile = await this.loadData() ?? {};
         this.settings = Object.assign({}, DEFAULT_SETTINGS, dataFile);
@@ -315,8 +376,22 @@ export default class OpenTabSettingsPlugin extends Plugin {
     }
 
     async updateSettings(settings: Partial<OpenTabSettingsPluginSettings>) {
+        const wasPreviewEnabled = this.settings.previewTabs;
         Object.assign(this.settings, settings);
         await this.saveData(this.settings);
+
+        // Toggle preview tab handlers when the setting changes
+        if (settings.previewTabs !== undefined && settings.previewTabs !== wasPreviewEnabled) {
+            if (settings.previewTabs) {
+                this.registerPreviewTabHandlers();
+            } else {
+                this.removePreviewTabHandlers();
+                // Promote existing preview tab
+                if (this.currentPreviewLeafId) {
+                    this.promotePreviewTab(this.currentPreviewLeafId);
+                }
+            }
+        }
     }
 
     private findMatchingLeaves(file: TFile) {
@@ -469,5 +544,124 @@ export default class OpenTabSettingsPlugin extends Plugin {
         }
 
         return leaf;
+    }
+
+    // --- Preview Tab Methods ---
+
+    private registerPreviewTabHandlers() {
+        if (this.previewHandlersRegistered || !this.settings.previewTabs) return;
+        this.previewHandlersRegistered = true;
+
+        // Click handler: detect file explorer clicks and set preview flag
+        this.boundClickHandler = (evt: MouseEvent) => {
+            if (!this.settings.previewTabs) return;
+            const target = (evt.target as HTMLElement).closest('.nav-file-title');
+            if (!target || !target.getAttribute('data-path')) return;
+            // Ignore modifier clicks — those go through existing mod-click behavior
+            if (evt.button !== 0 || evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.altKey) return;
+
+            // Don't preview if file is already open in a permanent tab — let normal dedup handle it.
+            // Reusing the preview leaf for a different file that's already open elsewhere causes
+            // openFile to be a no-op on the matched leaf (same file already showing).
+            const filePath = target.getAttribute('data-path')!;
+            const file = this.app.vault.getAbstractFileByPath(filePath);
+            if (file instanceof TFile) {
+                const permanentMatches = this.findMatchingLeaves(file).filter(l => !this.isPreviewTab(l.id));
+                if (permanentMatches.length > 0) {
+                    return;
+                }
+            }
+
+            this.nextOpenIsPreview = true;
+        };
+        document.addEventListener('click', this.boundClickHandler, true);
+
+        // Double-click handler: promote the preview tab to permanent
+        this.boundDblClickHandler = (evt: MouseEvent) => {
+            if (!this.settings.previewTabs) return;
+            const target = (evt.target as HTMLElement).closest('.nav-file-title');
+            if (!target) return;
+            const filePath = target.getAttribute('data-path');
+            if (!filePath) return;
+
+            this.promotePreviewForFile(filePath);
+        };
+        document.addEventListener('dblclick', this.boundDblClickHandler, true);
+
+        // Auto-promote on edit
+        this.registerEvent(
+            this.app.workspace.on('editor-change', () => {
+                if (!this.settings.previewTabsAutoPromote || !this.currentPreviewLeafId) return;
+                const activeLeaf = this.app.workspace.activeLeaf;
+                if (activeLeaf && activeLeaf.id === this.currentPreviewLeafId) {
+                    this.promotePreviewTab(activeLeaf.id);
+                }
+            })
+        );
+
+        // Clean up preview tracking on layout changes (tab closed, pinned, etc.)
+        this.registerEvent(
+            this.app.workspace.on('layout-change', () => {
+                if (this.currentPreviewLeafId) {
+                    const leaf = this.app.workspace.getLeafById(this.currentPreviewLeafId);
+                    if (!leaf) {
+                        this.currentPreviewLeafId = null;
+                    } else if (leaf.pinned) {
+                        this.promotePreviewTab(this.currentPreviewLeafId);
+                    }
+                }
+            })
+        );
+    }
+
+    private removePreviewTabHandlers() {
+        if (this.boundClickHandler) {
+            document.removeEventListener('click', this.boundClickHandler, true);
+            this.boundClickHandler = null;
+        }
+        if (this.boundDblClickHandler) {
+            document.removeEventListener('dblclick', this.boundDblClickHandler, true);
+            this.boundDblClickHandler = null;
+        }
+        this.previewHandlersRegistered = false;
+    }
+
+    private isPreviewTab(leafId: string): boolean {
+        return this.currentPreviewLeafId === leafId;
+    }
+
+    private markAsPreview(leaf: WorkspaceLeaf) {
+        // Clear previous preview style
+        if (this.currentPreviewLeafId && this.currentPreviewLeafId !== leaf.id) {
+            this.updatePreviewStyle(this.currentPreviewLeafId, false);
+        }
+        this.currentPreviewLeafId = leaf.id;
+        // Defer style update — tab header DOM may not exist yet
+        requestAnimationFrame(() => this.updatePreviewStyle(leaf.id, true));
+    }
+
+    private promotePreviewTab(leafId: string) {
+        if (this.currentPreviewLeafId === leafId) {
+            this.currentPreviewLeafId = null;
+        }
+        this.updatePreviewStyle(leafId, false);
+    }
+
+    private promotePreviewForFile(filePath: string) {
+        if (this.currentPreviewLeafId) {
+            const leaf = this.app.workspace.getLeafById(this.currentPreviewLeafId);
+            if (leaf && leaf.getViewState()?.state?.file === filePath) {
+                this.promotePreviewTab(this.currentPreviewLeafId);
+                return;
+            }
+        }
+    }
+
+    private updatePreviewStyle(leafId: string, isPreview: boolean) {
+        const leaf = this.app.workspace.getLeafById(leafId);
+        const tabHeader = (leaf as any)?.tabHeaderEl as HTMLElement | undefined;
+        if (tabHeader) {
+            tabHeader.classList.toggle('is-preview-tab', isPreview);
+        }
     }
 }
