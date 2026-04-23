@@ -1,5 +1,5 @@
 import {
-    Plugin, Workspace, WorkspaceLeaf, WorkspaceRoot, WorkspaceFloating, View, TFile, PaneType, WorkspaceTabs,
+    App, Plugin, Workspace, WorkspaceLeaf, WorkspaceRoot, WorkspaceFloating, View, TFile, PaneType, WorkspaceTabs,
     WorkspaceItem, Platform, Keymap, Notice,
 } from 'obsidian';
 import * as monkeyAround from 'monkey-around';
@@ -157,203 +157,201 @@ export default class OpenTabSettingsPlugin extends Plugin {
     }
 
     registerMonkeyPatches() {
-        const plugin = this;
+        const registerPatches = (plugin: OpenTabSettingsPlugin) => {
+            plugin.register(monkeyAround.around(Workspace.prototype, {
+                /**
+                 * Patch getLeaf to open leaves in new tab by default, based on settings.
+                 */
+                getLeaf: (oldMethod) => {
+                    return function(this: Workspace, openModeIn?: string|boolean, ...args: unknown[]) {
+                        const [openMode, override] = parseOverride(openModeIn);
+                        const settings = {...plugin.settings, ...override};
+                        const activeLeaf = this.getActiveViewOfType(View)?.leaf;
 
-        this.register(monkeyAround.around(Workspace.prototype, {
-            /**
-             * Patch getLeaf to open leaves in new tab by default, based on settings.
-             */
-            getLeaf(oldMethod: any) {
-                return function(this: Workspace, openModeIn?: string|boolean, ...args) {
-                    const [openMode, override] = parseOverride(openModeIn);
-                    const settings = {...plugin.settings, ...override};
-                    const activeLeaf = this.getActiveViewOfType(View)?.leaf;
+                        // Preview tab: intercept default (non-split, non-window) opens from file explorer
+                        const shouldPreview = (
+                            plugin.settings.previewTabs &&
+                            plugin.nextOpenIsPreview &&
+                            !openMode
+                        );
+                        plugin.nextOpenIsPreview = false; // consume the flag
 
-                    // Preview tab: intercept default (non-split, non-window) opens from file explorer
-                    const shouldPreview = (
-                        plugin.settings.previewTabs &&
-                        plugin.nextOpenIsPreview &&
-                        !openMode
-                    );
-                    plugin.nextOpenIsPreview = false; // consume the flag
-
-                    let leaf: WorkspaceLeaf;
-                    if (shouldPreview) {
-                        // Find existing preview leaf globally
-                        let existingPreview: WorkspaceLeaf | undefined;
-                        if (plugin.currentPreviewLeafId) {
-                            const found = this.getLeafById(plugin.currentPreviewLeafId);
-                            if (found && isMainLeaf(found) && !isEmptyLeaf(found)) {
-                                existingPreview = found;
+                        let leaf: WorkspaceLeaf;
+                        if (shouldPreview) {
+                            // Find existing preview leaf globally
+                            let existingPreview: WorkspaceLeaf | undefined;
+                            if (plugin.currentPreviewLeafId) {
+                                const found = this.getLeafById(plugin.currentPreviewLeafId);
+                                if (found && isMainLeaf(found) && !isEmptyLeaf(found)) {
+                                    existingPreview = found;
+                                }
                             }
-                        }
-                        if (existingPreview) {
-                            leaf = existingPreview;
-                            // Activate the reused preview leaf so the user sees the new file.
-                            // New leaves are activated inside createNewLeaf, but reused ones are not.
-                            this.setActiveLeaf(existingPreview);
+                            if (existingPreview) {
+                                leaf = existingPreview;
+                                // Activate the reused preview leaf so the user sees the new file.
+                                // New leaves are activated inside createNewLeaf, but reused ones are not.
+                                this.setActiveLeaf(existingPreview);
+                            } else {
+                                leaf = plugin.createNewLeaf(true, settings);
+                            }
+                        } else if (openMode == 'tab' || (!openMode && settings.openInNewTab)) {
+                            // Tabs opened via normal click are always focused regardless of focusNewTab setting.
+                            leaf = plugin.createNewLeaf(!openMode ? true : undefined, settings);
+                        } else if (!openMode) {
+                            leaf = plugin.getUnpinnedLeaf(true, settings);
                         } else {
-                            leaf = plugin.createNewLeaf(true, settings);
+                            leaf = (oldMethod as (...args: unknown[]) => WorkspaceLeaf).call(this, openMode, ...args);
                         }
-                    } else if (openMode == 'tab' || (!openMode && settings.openInNewTab)) {
-                        // Tabs opened via normal click are always focused regardless of focusNewTab setting.
-                        leaf = plugin.createNewLeaf(!openMode ? true : undefined, settings);
-                    } else if (!openMode) {
-                        leaf = plugin.getUnpinnedLeaf(true, settings);
-                    } else {
-                        leaf = oldMethod.call(this, openMode, ...args);
-                    }
 
-                    // we set these to be used in openFile so we can tell when to deduplicate files.
-                    leaf.openTabSettings = {
-                        openMode, override,
-                        openedFrom: activeLeaf?.id,
-                        isPreview: shouldPreview,
-                    }
-
-                    return leaf;
-                }
-            },
-
-            /**
-             * getUnpinnedLeaf is deprecated in favor of getLeaf(false). However, it is used in a couple places in
-             * Obsidian and many plugins still use it directly. So we'll patch it as well to enforce new tab behavior.
-             *
-             * Note that as of 1.9.10, getUnpinnedLeaf takes an undocumented "focus" boolean. Obsidian uses this param
-             * when using ctrl and arrow keys in the file explorer to open files.
-             */
-            getUnpinnedLeaf(oldMethod: any) {
-                return function(this: Workspace, focus?: boolean) {
-                    if (plugin.settings.openInNewTab) {
-                        return this.getLeaf("tab");
-                    } else {
-                        return plugin.getUnpinnedLeaf(focus);
-                    }
-                }
-            },
-        }));
-
-        // Patch openFile to deduplicate tabs
-        this.register(monkeyAround.around(WorkspaceLeaf.prototype, {
-            openFile(oldMethod: any) {
-                return async function(this: WorkspaceLeaf, file, openState, ...args) {
-                    // openFile doesn't return anything, but just in case that changes.
-                    let result: any;
-                    let match: WorkspaceLeaf|undefined;
-
-                    // these values are only valid immediately after creating a leaf. We clear them after openFile,
-                    // and also clear them here if the leaf somehow gets populated without openFile.
-                    // Read values BEFORE deleting — preview tab reuse sets openTabSettings on a non-empty leaf.
-                    const tabSettings = this.openTabSettings;
-                    if (!isEmptyLeaf(this)) delete this.openTabSettings;
-
-                    const {openMode, override, openedFrom, isPreview} = tabSettings ?? {};
-                    const settings = {...plugin.settings, ...override};
-
-                    let matches = plugin.findMatchingLeaves(file);
-                    if (!settings.deduplicateAcrossTabGroups) {
-                        matches = matches.filter(l => l.parent == this.parent);
-                    }
-                    // When opening in preview mode, exclude existing preview tabs from dedup matches.
-                    // We want to find permanent tabs only — preview tabs should be reused, not deduped to.
-                    if (isPreview) {
-                        matches = matches.filter(l => !plugin.isPreviewTab(l.id));
-                    }
-
-                    // if leaf is new and was opened via an explicit open in new window, split, or "allow duplicate",
-                    // don't deduplicate. Note that opening in new window doesn't call getLeaf (it calls openPopoutLeaf
-                    // directly) so we assume undefined openType is a new window. getLeaf("same") will update openType,
-                    // so we shouldn't need to worry about if openType is undefined because the leaf was created before
-                    // the plugin was loaded or such.
-                    const isSpecialOpen = (
-                        !isMainLeaf(this) ||
-                        (isEmptyLeaf(this) && ![false, "tab"].includes(openMode ?? 'unknown'))
-                    );
-                    const isInternalLink = (
-                        isEmptyLeaf(this) && openMode === false &&
-                        !!openState?.eState?.subpath &&
-                        matches.some(l => l.id == openedFrom)
-                    );
-                    const isMatch = matches.includes(this);
-
-                    // if the link opened was an internal link, always deduplicate to undo open in new tab.
-                    if (isInternalLink && !isSpecialOpen && !isMatch) {
-                        match = matches.find(l => l.id == openedFrom)!;
-                    } else if (settings.deduplicateTabs && !isSpecialOpen && matches.length > 0 && !isMatch) {
-                        // choose matches first from last opened from, then matches in same group, then fist in list.
-                        match = matches.find(l => l.id == openedFrom);
-                        if (!match) matches.find(l => l.parent == this.parent);
-                        if (!match) match = matches[0];
-                    }
-
-                    if (match) {
-                        // If dedup routes to a preview tab (from a non-file-explorer source), promote it
-                        if (plugin.isPreviewTab(match.id)) {
-                            plugin.promotePreviewTab(match.id);
+                        // we set these to be used in openFile so we can tell when to deduplicate files.
+                        leaf.openTabSettings = {
+                            openMode, override,
+                            openedFrom: activeLeaf?.id,
+                            isPreview: shouldPreview,
                         }
-                        if (match.view.getViewType() == "kanban") {
-                            // workaround for a bug in kanban. See
-                            //     https://github.com/jesse-r-s-hines/obsidian-open-tab-settings/issues/25
-                            //     https://github.com/mgmeyers/obsidian-kanban/issues/1102
-                            plugin.app.workspace.setActiveLeaf(matches[0]);
-                            result = undefined;
+
+                        return leaf;
+                    }
+                },
+
+                /**
+                 * getUnpinnedLeaf is deprecated in favor of getLeaf(false). However, it is used in a couple places in
+                 * Obsidian and many plugins still use it directly. So we'll patch it as well to enforce new tab behavior.
+                 *
+                 * Note that as of 1.9.10, getUnpinnedLeaf takes an undocumented "focus" boolean. Obsidian uses this param
+                 * when using ctrl and arrow keys in the file explorer to open files.
+                 */
+                getUnpinnedLeaf: (_oldMethod) => {
+                    return function(this: Workspace, focus?: boolean) {
+                        if (plugin.settings.openInNewTab) {
+                            return this.getLeaf("tab");
                         } else {
-                            const activeLeaf = plugin.app.workspace.getActiveViewOfType(View)?.leaf;
-                            const shouldBeActive = !!openState?.active || activeLeaf == this;
-                            result = await oldMethod.call(matches[0], file, {
-                                ...openState,
-                                active: shouldBeActive,
-                            }, ...args);
-                            // Explicitly activate — openFile may be a no-op when the file is already
-                            // showing, skipping the active flag processing.
-                            if (shouldBeActive) {
+                            return plugin.getUnpinnedLeaf(focus);
+                        }
+                    }
+                },
+            }));
+
+            // Patch openFile to deduplicate tabs
+            plugin.register(monkeyAround.around(WorkspaceLeaf.prototype, {
+                openFile: (oldMethod) => {
+                    return async function(this: WorkspaceLeaf, file: TFile, openState: Record<string, unknown>, ...args: unknown[]): Promise<void> {
+                        let match: WorkspaceLeaf|undefined;
+
+                        // these values are only valid immediately after creating a leaf. We clear them after openFile,
+                        // and also clear them here if the leaf somehow gets populated without openFile.
+                        // Read values BEFORE deleting — preview tab reuse sets openTabSettings on a non-empty leaf.
+                        const tabSettings = this.openTabSettings;
+                        if (!isEmptyLeaf(this)) delete this.openTabSettings;
+
+                        const {openMode, override, openedFrom, isPreview} = tabSettings ?? {};
+                        const settings = {...plugin.settings, ...override};
+
+                        let matches = plugin.findMatchingLeaves(file);
+                        if (!settings.deduplicateAcrossTabGroups) {
+                            matches = matches.filter(l => l.parent == this.parent);
+                        }
+                        // When opening in preview mode, exclude existing preview tabs from dedup matches.
+                        // We want to find permanent tabs only — preview tabs should be reused, not deduped to.
+                        if (isPreview) {
+                            matches = matches.filter(l => !plugin.isPreviewTab(l.id));
+                        }
+
+                        // if leaf is new and was opened via an explicit open in new window, split, or "allow duplicate",
+                        // don't deduplicate. Note that opening in new window doesn't call getLeaf (it calls openPopoutLeaf
+                        // directly) so we assume undefined openType is a new window. getLeaf("same") will update openType,
+                        // so we shouldn't need to worry about if openType is undefined because the leaf was created before
+                        // the plugin was loaded or such.
+                        const isSpecialOpen = (
+                            !isMainLeaf(this) ||
+                            (isEmptyLeaf(this) && ![false, "tab"].includes(openMode ?? 'unknown'))
+                        );
+                        const eState = openState?.eState as Record<string, unknown> | undefined;
+                        const isInternalLink = (
+                            isEmptyLeaf(this) && openMode === false &&
+                            !!eState?.subpath &&
+                            matches.some(l => l.id == openedFrom)
+                        );
+                        const isMatch = matches.includes(this);
+
+                        // if the link opened was an internal link, always deduplicate to undo open in new tab.
+                        if (isInternalLink && !isSpecialOpen && !isMatch) {
+                            match = matches.find(l => l.id == openedFrom)!;
+                        } else if (settings.deduplicateTabs && !isSpecialOpen && matches.length > 0 && !isMatch) {
+                            // choose matches first from last opened from, then matches in same group, then fist in list.
+                            match = matches.find(l => l.id == openedFrom);
+                            if (!match) matches.find(l => l.parent == this.parent);
+                            if (!match) match = matches[0];
+                        }
+
+                        if (match) {
+                            // If dedup routes to a preview tab (from a non-file-explorer source), promote it
+                            if (plugin.isPreviewTab(match.id)) {
+                                plugin.promotePreviewTab(match.id);
+                            }
+                            if (match.view.getViewType() == "kanban") {
+                                // workaround for a bug in kanban. See
+                                //     https://github.com/jesse-r-s-hines/obsidian-open-tab-settings/issues/25
+                                //     https://github.com/mgmeyers/obsidian-kanban/issues/1102
                                 plugin.app.workspace.setActiveLeaf(matches[0]);
+                            } else {
+                                const activeLeaf = plugin.app.workspace.getActiveViewOfType(View)?.leaf;
+                                const shouldBeActive = !!openState?.active || activeLeaf == this;
+                                await (oldMethod as (...args: unknown[]) => Promise<void>).call(matches[0], file, {
+                                    ...openState,
+                                    active: shouldBeActive,
+                                }, ...args);
+                                // Explicitly activate — openFile may be a no-op when the file is already
+                                // showing, skipping the active flag processing.
+                                if (shouldBeActive) {
+                                    plugin.app.workspace.setActiveLeaf(matches[0]);
+                                }
+                            }
+                        } else { // use default behavior
+                            await (oldMethod as (...args: unknown[]) => Promise<void>).call(this, file, openState, ...args);
+                        }
+
+                        // Preview tab bookkeeping
+                        if (isPreview && !match) {
+                            plugin.markAsPreview(this);
+                        }
+
+                        // If the leaf is still empty, close it. This can happen if the file was de-duplicated while
+                        // "openInNewTab" is enabled, or if you open a file "in default app" in a new tab.
+                        if (isEmptyLeaf(this) && this.parent.children.length > 1) {
+                            const tabGroup = this.parent;
+                            const wasCurrentTab = tabGroup.children[tabGroup.currentTab] === this;
+                            const lastActiveTab = tabGroup.children
+                                .filter(l => l !== this)
+                                .reduce((max, l) => l.activeTime > max.activeTime ? l : max);
+                            this.detach();
+                            if (wasCurrentTab) {
+                                tabGroup.selectTabIndex(tabGroup.children.findIndex(c => c === lastActiveTab));
                             }
                         }
-                    } else { // use default behavior
-                        result = await oldMethod.call(this, file, openState, ...args);
-                    }
 
-                    // Preview tab bookkeeping
-                    if (isPreview && !match) {
-                        plugin.markAsPreview(this);
+                        delete this.openTabSettings;
                     }
+                },
+            }));
 
-                    // If the leaf is still empty, close it. This can happen if the file was de-duplicated while
-                    // "openInNewTab" is enabled, or if you open a file "in default app" in a new tab.
-                    if (isEmptyLeaf(this) && this.parent.children.length > 1) {
-                        const tabGroup = this.parent;
-                        const wasCurrentTab = tabGroup.children[tabGroup.currentTab] === this;
-                        const lastActiveTab = tabGroup.children
-                            .filter(l => l !== this)
-                            .reduce((max, l) => l.activeTime > max.activeTime ? l : max);
-                        this.detach();
-                        if (wasCurrentTab) {
-                            tabGroup.selectTabIndex(tabGroup.children.findIndex(c => c === lastActiveTab));
+            // Patch isModEvent to add override settings
+            // We could have used isModEvent to implement openInNewTab instead of getLeaf, but there's quite a few places
+            // that call getLeaf without isModEvent, such as the graph view.
+            plugin.register(monkeyAround.around(Keymap, {
+                isModEvent: (oldMethod) => {
+                    return function(this: typeof Keymap, ...args: unknown[]): boolean | PaneType {
+                        let result: boolean | PaneType | null = (oldMethod as (...args: unknown[]) => boolean | PaneType | null).call(this, ...args);
+                        if (result == "tab") {
+                            result = OVERRIDES[plugin.settings.modClickBehavior] as PaneType;
                         }
-                    }
+                        return result ?? false;
+                    } as typeof Keymap.isModEvent;
+                },
+            }));
+        };
 
-                    delete this.openTabSettings;
-
-                    return result;
-                }
-            },
-        }));
-
-        // Patch isModEvent to add override settings
-        // We could have used isModEvent to implement openInNewTab instead of getLeaf, but there's quite a few places
-        // that call getLeaf without isModEvent, such as the graph view.
-        this.register(monkeyAround.around(Keymap, {
-            isModEvent(oldMethod: any) {
-                return function(this: any, ...args) {
-                    let result = oldMethod.call(this, ...args);
-                    if (result == "tab") {
-                        result = OVERRIDES[plugin.settings.modClickBehavior];
-                    }
-                    return result;
-                }
-            },
-        }));
+        registerPatches(this);
     }
 
     onunload() {
@@ -431,10 +429,9 @@ export default class OpenTabSettingsPlugin extends Plugin {
      * @param focus Whether to focus the new tab. If undefined focus based on focusNewTab config
      */
     private createNewLeaf(focus?: boolean, override: Partial<OpenTabSettingsPluginSettings> = {}) {
-        const plugin = this;
-        const workspace = plugin.app.workspace;
-        focus = focus ?? plugin.app.vault.getConfig('focusNewTab') as boolean;
-        const settings = {...plugin.settings, ...override};
+        const workspace = this.app.workspace;
+        focus = focus ?? this.app.vault.getConfig('focusNewTab') as boolean;
+        const settings = {...this.settings, ...override};
 
         const activeLeaf = workspace.getMostRecentLeaf();
         if (!activeLeaf) throw new Error("No tab group found.");
@@ -450,7 +447,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
         let index: number|undefined;
 
         if (settings.newTabTabGroupPlacement != "same" && !Platform.isPhone) {
-            const tabGroups = plugin.getAllTabGroups(activeLeaf.getRoot());
+            const tabGroups = this.getAllTabGroups(activeLeaf.getRoot());
             const otherTabGroup = tabGroups.filter(g => g !== activeTabGroup).at(-1);
             if (settings.newTabTabGroupPlacement == "opposite" && otherTabGroup) {
                 group = otherTabGroup;
@@ -490,7 +487,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
         if (isEmptyLeaf(leafToDisplace)) {
             newLeaf = leafToDisplace;
         } else {
-            newLeaf = new (WorkspaceLeaf as any)(this.app);
+            newLeaf = new (WorkspaceLeaf as unknown as new (app: App) => WorkspaceLeaf)(this.app);
             const currentTab = group.currentTab;
             // If new tab is inserted before the currently tab in a group, and we aren't setting the new tab active, we
             // need to update the selected tab so that group.currentTab index still points to the original active tab
@@ -512,11 +509,10 @@ export default class OpenTabSettingsPlugin extends Plugin {
      * e.g. when the active tab is pinned.
      */
     private getUnpinnedLeaf(focus = true, override: Partial<OpenTabSettingsPluginSettings> = {}) {
-        const plugin = this;
-        const workspace = plugin.app.workspace;
-        const settings = {...plugin.settings, ...override};
+        const workspace = this.app.workspace;
+        const settings = {...this.settings, ...override};
 
-        const activeLeaf = workspace.activeLeaf;
+        const activeLeaf = workspace.getActiveViewOfType(View)?.leaf;
         if (activeLeaf?.canNavigate()) {
             return activeLeaf;
         }
@@ -538,7 +534,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
         });
 
         if (!leaf) {
-            leaf = plugin.createNewLeaf(focus, settings);
+            leaf = this.createNewLeaf(focus, settings);
         } else if (focus) {
             workspace.setActiveLeaf(leaf);
         }
@@ -592,7 +588,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on('editor-change', () => {
                 if (!this.settings.previewTabsAutoPromote || !this.currentPreviewLeafId) return;
-                const activeLeaf = this.app.workspace.activeLeaf;
+                const activeLeaf = this.app.workspace.getActiveViewOfType(View)?.leaf;
                 if (activeLeaf && activeLeaf.id === this.currentPreviewLeafId) {
                     this.promotePreviewTab(activeLeaf.id);
                 }
@@ -659,7 +655,7 @@ export default class OpenTabSettingsPlugin extends Plugin {
 
     private updatePreviewStyle(leafId: string, isPreview: boolean) {
         const leaf = this.app.workspace.getLeafById(leafId);
-        const tabHeader = (leaf as any)?.tabHeaderEl as HTMLElement | undefined;
+        const tabHeader = (leaf as unknown as { readonly tabHeaderEl?: HTMLElement })?.tabHeaderEl;
         if (tabHeader) {
             tabHeader.classList.toggle('is-preview-tab', isPreview);
         }
