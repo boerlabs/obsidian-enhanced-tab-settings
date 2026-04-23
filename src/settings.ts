@@ -145,7 +145,7 @@ export class OpenTabSettingsPluginSettingTab extends PluginSettingTab {
 
         new Setting(this.containerEl)
             .setName('Mod click behavior')
-            .setDesc('Control what happens when you Ctrl/Cmd/middle click a link.')
+            .setDesc('Choose the behavior when clicking links with modifier keys or the middle mouse button.')
             .addDropdown(dropdown => {
                 dropdown.addOption("tab", MOD_CLICK_BEHAVIOR['tab']);
                 if (this.plugin.settings.openInNewTab) {
